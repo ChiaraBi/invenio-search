@@ -26,7 +26,8 @@ def test_init(app, template_entrypoints):
     """Run client initialization."""
     suffix = '-abc'
     search = app.extensions['invenio-search']
-    search.register_mappings('records', 'mock_module.mappings', suffix=suffix)
+    search._current_suffix = suffix
+    search.register_mappings('records', 'mock_module.mappings')
 
     assert 'records' in search.aliases
     assert set(search.aliases['records']) == {
@@ -41,11 +42,11 @@ def test_init(app, template_entrypoints):
         'records-bibliographic-bibliographic-v1.0.0',
     }
     assert set(search.mappings.keys()) == {
-        'records-authorities-authority-v1.0.0{}'.format(suffix),
-        'records-bibliographic-bibliographic-v1.0.0{}'.format(suffix),
-        'records-default-v1.0.0{}'.format(suffix)
+        'records-authorities-authority-v1.0.0',
+        'records-bibliographic-bibliographic-v1.0.0',
+        'records-default-v1.0.0'
     }
-    assert 3 == search.number_of_indexes
+    assert 3 == len(search.mappings)
 
     with patch('invenio_search.ext.iter_entry_points',
                return_value=template_entrypoints('invenio_search.templates')):
@@ -97,10 +98,12 @@ def test_init(app, template_entrypoints):
 
 def test_list(app):
     """Run listing of mappings."""
+    suffix = '-abc'
     app.config['SEARCH_MAPPINGS'] = ['records']
     search = app.extensions['invenio-search']
-    search.register_mappings('authors', 'mock_module.mappings', suffix='-abc')
-    search.register_mappings('records', 'mock_module.mappings', suffix='-abc')
+    search._current_suffix = suffix
+    search.register_mappings('authors', 'mock_module.mappings')
+    search.register_mappings('records', 'mock_module.mappings')
 
     runner = CliRunner()
     script_info = ScriptInfo(create_app=lambda info: app)
@@ -113,16 +116,12 @@ def test_list(app):
     assert result.output == (
         u"├──authors\n"
         u"│  └──authors-authors-v1.0.0\n"
-        u"│     └──authors-authors-v1.0.0-abc\n"
         u"└──records *\n"
         u"   ├──records-authorities\n"
         u"   │  └──records-authorities-authority-v1.0.0\n"
-        u"   │     └──records-authorities-authority-v1.0.0-abc\n"
         u"   ├──records-bibliographic\n"
         u"   │  └──records-bibliographic-bibliographic-v1.0.0\n"
-        u"   │     └──records-bibliographic-bibliographic-v1.0.0-abc\n"
-        u"   └──records-default-v1.0.0\n"
-        u"      └──records-default-v1.0.0-abc\n\n"
+        u"   └──records-default-v1.0.0\n\n"
     )
 
 

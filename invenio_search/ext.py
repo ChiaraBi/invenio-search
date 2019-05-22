@@ -27,17 +27,7 @@ from werkzeug.utils import cached_property
 from . import config
 from .cli import index as index_cmd
 from .proxies import current_search_client
-from .utils import build_index_name, build_suffix_index_name, prefix_index, \
-    timestamp_suffix
-
-
-def _get_indices(tree_or_filename):
-    for name, value in tree_or_filename.items():
-        if isinstance(value, dict):
-            for result in _get_indices(value):
-                yield result
-        else:
-            yield name
+from .utils import build_index_from_parts, build_index_name, timestamp_suffix
 
 
 class _SearchState(object):
@@ -58,10 +48,9 @@ class _SearchState(object):
         self.app = app
         self.mappings = {}
         self.aliases = {}
-        self.number_of_indexes = 0
         self._client = kwargs.get('client')
         self.entry_point_group_templates = entry_point_group_templates
-        self.current_suffix = None
+        self._current_suffix = None
 
         if entry_point_group_mappings:
             self.load_entry_point_group_mappings(entry_point_group_mappings)
@@ -70,6 +59,12 @@ class _SearchState(object):
             warnings.warn(
                 "Elasticsearch v2 support will be removed.",
                 DeprecationWarning)
+
+    @property
+    def current_suffix(self):
+        if self._current_suffix is None:
+            self.generate_suffix()
+        return self._current_suffix
 
     @cached_property
     def templates(self):
@@ -91,20 +86,15 @@ class _SearchState(object):
 
         :param force: Generate a new suffix even if an old one already exists.
         """
-        if force or self.current_suffix is None:
-            self.current_suffix = timestamp_suffix()
+        if force or self._current_suffix is None:
+            self._current_suffix = timestamp_suffix()
 
-    def register_mappings(self, alias, package_name, suffix=None):
+    def register_mappings(self, alias, package_name):
         """Register mappings from a package under given alias.
 
         :param alias: The alias.
         :param package_name: The package name.
         """
-        if suffix is None:
-            self.generate_suffix()
-        else:
-            self.current_suffix = suffix
-
         # For backwards compatibility, we also allow for ES2 mappings to be
         # placed at the root level of the specified package path, and not in
         # the `<package-path>/v2` directory.
@@ -127,7 +117,7 @@ class _SearchState(object):
             package_name = '{}.v{}'.format(package_name, ES_VERSION[0])
 
         def _walk_dir(aliases, *parts):
-            root_name = build_index_name(self.app, *parts)
+            root_name = build_index_from_parts(*parts)
             resource_name = os.path.join(*parts)
 
             data = aliases.get(root_name, {})
@@ -139,27 +129,18 @@ class _SearchState(object):
                     _walk_dir(data, *(parts + (filename, )))
                     continue
 
-                ext = os.path.splitext(filename)[1]
+                filename_root, ext = os.path.splitext(filename)
                 if ext not in {'.json', }:
                     continue
 
-                alias_name = build_index_name(
-                    self.app,
-                    *(parts + (filename, ))
+                index_name = build_index_from_parts(
+                    *(parts + (filename_root, ))
                 )
-                index_name = build_suffix_index_name(
-                    self.app,
-                    self.current_suffix,
-                    *(parts + (filename, ))
-                )
-                assert alias_name not in data, 'Duplicate alias'
+                assert index_name not in data, 'Duplicate index'
                 filename = resource_filename(
                     package_name, os.path.join(resource_name, filename))
-                data[alias_name] = {
-                    index_name: filename
-                }
+                data[index_name] = filename
                 self.mappings[index_name] = filename
-                self.number_of_indexes += 1
 
             aliases[root_name] = data
 
@@ -190,20 +171,19 @@ class _SearchState(object):
             resource_name = os.path.join(*parts)
 
             for filename in resource_listdir(module_name, resource_name):
-                template_name = build_index_name(
-                    self.app,
-                    *(parts[1:] + (filename, ))
-                )
                 file_path = os.path.join(resource_name, filename)
 
                 if resource_isdir(module_name, file_path):
                     _walk_dir((parts + (filename, )))
                     continue
 
-                ext = os.path.splitext(filename)[1]
+                filename_root, ext = os.path.splitext(filename)
                 if ext not in {'.json', }:
                     continue
 
+                template_name = build_index_from_parts(
+                    *(parts[1:] + (filename_root, ))
+                )
                 result[template_name] = resource_filename(
                     module_name, os.path.join(resource_name, filename))
 
@@ -248,8 +228,9 @@ class _SearchState(object):
            Do not call this method unless you know what you are doing. This
            method is only intended to be called during tests.
         """
-        self.client.indices.flush(wait_if_ongoing=True, index=index)
-        self.client.indices.refresh(index=index)
+        prefixed_index = build_index_name(index, suffix='', app=self.app)
+        self.client.indices.flush(wait_if_ongoing=True, index=prefixed_index)
+        self.client.indices.refresh(index=prefixed_index)
         self.client.cluster.health(
             wait_for_status='yellow', request_timeout=30)
         return True
@@ -268,50 +249,84 @@ class _SearchState(object):
         `SEARCH_MAPPINGS` config variable. If the `SEARCH_MAPPINGS` is set to
         `None` (the default), all aliases are included.
         """
-        search_mappings = self.app.config.get('SEARCH_MAPPINGS')
-        if search_mappings:
-            whitelisted_aliases = [
-                prefix_index(self.app, index) for index in search_mappings
-            ]
-        else:
-            whitelisted_aliases = search_mappings
-
+        whitelisted_aliases = self.app.config.get('SEARCH_MAPPINGS')
         if whitelisted_aliases is None:
             return self.aliases
         else:
             return {k: v for k, v in self.aliases.items()
                     if k in whitelisted_aliases}
 
+    def _get_indices(self, tree_or_filename):
+        for name, value in tree_or_filename.items():
+            if isinstance(value, dict):
+                for result in self._get_indices(value):
+                    yield result
+            else:
+                yield name
+
+    def create_index(self, index, mapping_path=None, prefix=None, suffix=None,
+                     create_alias=True, ignore=None):
+        mapping_path = mapping_path or self.mappings[index]
+
+        index_result = None, None
+        alias_result = None, None
+        # To prevent index init --force from creating a suffixed
+        # index if the current instance is running without suffixes
+        # make sure there is no index with the same name as the
+        # alias name (i.e. the index name without the suffix).
+        if not self.client.indices.exists(index):
+            with open(mapping_path, 'r') as body:
+                final_index = build_index_name(
+                    index, prefix=prefix, suffix=suffix, app=self.app)
+                index_result = (
+                    final_index,
+                    self.client.indices.create(
+                        index=final_index,
+                        body=json.load(body),
+                        ignore=ignore,
+                    )
+                )
+                if create_alias:
+                    final_alias = build_index_name(
+                        index, prefix=prefix, suffix='', app=self.app)
+                    alias_result = (
+                        final_alias,
+                        self.client.indices.put_alias(
+                            index=final_index,
+                            name=final_alias,
+                            ignore=ignore,
+                        )
+                    )
+        return index_result, alias_result
+
     def create(self, ignore=None):
         """Yield tuple with created index name and responses from a client."""
         ignore = ignore or []
+        created_indices = {}
 
         def _create(tree_or_filename, alias=None):
             """Create indices and aliases by walking DFS."""
-            # Iterate over aliases:
             for name, value in tree_or_filename.items():
                 if isinstance(value, dict):
                     for result in _create(value, alias=name):
                         yield result
                 else:
-                    # To prevent index init --force from creating a suffixed
-                    # index if the current instance is running without suffixes
-                    # make sure there is no index with the same name as the
-                    # alias name (i.e. the index name without the suffix).
-                    alias_parts = name.split('-')[:-1]
-                    alias_name = '-'.join(alias_parts)
-                    if not self.client.indices.exists([alias_name]):
-                        with open(value, 'r') as body:
-                            yield name, self.client.indices.create(
-                                index=name,
-                                body=json.load(body),
-                                ignore=ignore,
-                            )
-
+                    index_result, alias_result = \
+                        self.create_index(name, ignore=ignore)
+                    if all(index_result):
+                        created_indices[name] = index_result[0]
+                        yield index_result
+                    else:
+                        created_indices[name] = name
+                    if all(alias_result):
+                        yield alias_result
             if alias:
-                yield alias, self.client.indices.put_alias(
-                    index=list(_get_indices(tree_or_filename)),
-                    name=alias,
+                alias_indices = self._get_indices(tree_or_filename)
+                alias_indices = [created_indices[i] for i in alias_indices]
+                alias_name = build_index_name(alias, suffix='', app=self.app)
+                yield alias_name, self.client.indices.put_alias(
+                    index=alias_indices,
+                    name=alias_name,
                     ignore=ignore,
                 )
 
@@ -339,9 +354,11 @@ class _SearchState(object):
             with open(self.templates[template], 'r') as fp:
                 body = fp.read()
                 replaced_body = _replace_prefix(self.templates[template], body)
+                template_name = build_index_name(
+                    template, suffix='', app=self.app)
                 return self.templates[template],\
                     current_search_client.indices.put_template(
-                        name=template,
+                        name=template_name,
                         body=json.loads(replaced_body),
                         ignore=ignore,
                 )
@@ -355,23 +372,33 @@ class _SearchState(object):
 
         def _delete(tree_or_filename, alias=None):
             """Delete indexes and aliases by walking DFS."""
-            if alias:
-                yield alias, self.client.indices.delete_alias(
-                    index=list(_get_indices(tree_or_filename)),
-                    name=alias,
-                    ignore=ignore,
-                )
-
             # Iterate over aliases:
             for name, value in tree_or_filename.items():
                 if isinstance(value, dict):
                     for result in _delete(value, alias=name):
                         yield result
                 else:
-                    yield name, self.client.indices.delete(
-                        index=name,
-                        ignore=ignore,
-                    )
+                    # Resolve values to suffixed (or not) indices
+                    prefixed_index = build_index_name(
+                        name, suffix='', app=self.app)
+                    lookup_response = self.client.indices.get_alias(
+                        index=prefixed_index, ignore=[404])
+                    if 'error' in lookup_response:
+                        indices_to_delete = []
+                    else:
+                        indices_to_delete = list(lookup_response.keys())
+                    if len(indices_to_delete) == 0:
+                        pass
+                    elif len(indices_to_delete) == 1:
+                        yield name, self.client.indices.delete(
+                            index=indices_to_delete[0],
+                            ignore=ignore,
+                        )
+                    else:
+                        warnings.warn((
+                            'Multiple indices found during deletion of '
+                            '{name}: {indices}. Deletion was skipped for them.'
+                        ).format(name=name, indices=indices_to_delete))
 
         for result in _delete(self.active_aliases):
             yield result

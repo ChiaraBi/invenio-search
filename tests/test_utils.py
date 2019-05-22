@@ -9,7 +9,7 @@
 import pytest
 from mock import patch
 
-from invenio_search.utils import build_suffix_index_name, schema_to_index
+from invenio_search.utils import build_index_name, schema_to_index
 
 
 @pytest.mark.parametrize(
@@ -66,5 +66,4 @@ def test_schema_to_index_prefixes_indices(app):
 ])
 def test_build_suffix_index_name(app, parts, prefix, suffix, expected):
     app.config.update(SEARCH_INDEX_PREFIX=prefix)
-
-    assert build_suffix_index_name(app, suffix, *parts) == expected
+    assert build_index_name(parts, suffix=suffix, app=app) == expected
